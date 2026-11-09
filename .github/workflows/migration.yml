@@ -1,0 +1,85 @@
+name: Idempotent Mattermost Migration & Upgrade
+on:
+  push:
+    branches: ["migration"]
+  workflow_dispatch:
+
+env:
+  COMPOSE_FILE: docker-compose.prod.yml
+  DB_POSTGRES_PASSWORD: ${{ secrets.DB_POSTGRES_PASSWORD }}
+  DB_MYSQL_ROOT_PASSWORD: ${{ secrets.DB_MYSQL_ROOT_PASSWORD }}
+
+jobs:
+  migrate-and-deploy:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check Migration Status
+        id: check_status
+        run: |
+          if [ -f "$HOME/.mattermost_migration_completed" ]; then
+            echo "Already migrated. Skipping data transfer."
+            echo "already_migrated=true" >> $GITHUB_OUTPUT
+          else
+            echo "Migration required."
+            echo "already_migrated=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Stop legacy Mattermost app
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: docker stop mattermost || true
+
+      - name: Backup Legacy MySQL
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          mkdir -p "$HOME/mattermost_backups"
+          BACKUP="$HOME/mattermost_backups/mysql_backup_${{ github.run_id }}.sql"
+          if docker ps | grep -q "mattermost-mysql"; then
+            docker exec -e MYSQL_PWD="$DB_MYSQL_ROOT_PASSWORD" mattermost-mysql \
+              mysqldump -u root mattermost > "$BACKUP"
+            echo "Backup saved: $BACKUP"
+          else
+            echo "Legacy MySQL container is not running!"
+            exit 1
+          fi
+
+      - name: Start Target PostgreSQL
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          docker compose -f $COMPOSE_FILE up -d mattermost-postgres
+          sleep 15
+
+      - name: Run pgloader (include drop for idempotency)
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          docker run --rm --platform linux/amd64 \
+            --network=mattermost_mattermost_network \
+            mattermost/mattermost-pgloader:latest pgloader \
+            --with "include drop" \
+            "mysql://root:${DB_MYSQL_ROOT_PASSWORD}@mattermost-mysql/mattermost" \
+            "postgresql://postgres:${DB_POSTGRES_PASSWORD}@mattermost-postgres/mattermost"
+
+      - name: Mark Migration as Completed
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: touch "$HOME/.mattermost_migration_completed"
+
+      - name: Deploy Upgraded Stack
+        run: |
+          docker compose -f $COMPOSE_FILE up -d --remove-orphans
+
+      - name: Health Check
+        run: |
+          for i in $(seq 1 40); do
+            if curl -fsS http://localhost:8065/api/v4/system/ping; then
+              echo ""
+              echo "Mattermost is running on Postgres!"
+              exit 0
+            fi
+            echo "Waiting for Mattermost ($i/40)..."
+            sleep 6
+          done
+          echo "Health check failed. Logs:"
+          docker compose -f $COMPOSE_FILE logs --tail 50
+          exit 1
