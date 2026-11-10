@@ -83,9 +83,14 @@ jobs:
       - name: Generate pgloader config
         if: steps.check_status.outputs.already_migrated == 'false'
         run: |
-          docker run --rm --network $NET \
-            -e MYSQL_PW="$DB_MYSQL_ROOT_PASSWORD" -e PG_PW="$DB_POSTGRES_PASSWORD" \
-            golang:1.23 sh -c 'go install github.com/mattermost/migration-assist/cmd/migration-assist@latest >&2 && /go/bin/migration-assist pgloader --mysql="root:$MYSQL_PW@tcp(mattermost-mysql:3306)/mattermost" --postgres="postgres://postgres:$PG_PW@mattermost-postgres:5432/mattermost?sslmode=disable" --remove-null-chars' > migration.load
+          for i in 1 2 3; do
+            docker run --rm --network $NET -e GONOSUMDB='github.com/mattermost/*' \
+              -e MYSQL_PW="$DB_MYSQL_ROOT_PASSWORD" -e PG_PW="$DB_POSTGRES_PASSWORD" \
+              golang:1.23 sh -c 'go install github.com/mattermost/migration-assist/cmd/migration-assist@latest >&2 && /go/bin/migration-assist pgloader --mysql="root:$MYSQL_PW@tcp(mattermost-mysql:3306)/mattermost" --postgres="postgres://postgres:$PG_PW@mattermost-postgres:5432/mattermost?sslmode=disable" --remove-null-chars' > migration.load && [ -s migration.load ] && exit 0
+            echo "Attempt $i failed, retrying..."
+            sleep 15
+          done
+          exit 1
 
       - name: Run pgloader (data only)
         if: steps.check_status.outputs.already_migrated == 'false'
@@ -103,7 +108,13 @@ jobs:
       - name: Create indexes (post-migrate)
         if: steps.check_status.outputs.already_migrated == 'false'
         run: |
-          docker run --rm --network $NET -e PG_PW="$DB_POSTGRES_PASSWORD" golang:1.23 sh -c 'go install github.com/mattermost/migration-assist/cmd/migration-assist@latest >&2 && /go/bin/migration-assist postgres post-migrate "postgres://postgres:$PG_PW@mattermost-postgres:5432/mattermost?sslmode=disable"'
+          for i in 1 2 3; do
+            docker run --rm --network $NET -e GONOSUMDB='github.com/mattermost/*' -e PG_PW="$DB_POSTGRES_PASSWORD" \
+              golang:1.23 sh -c 'go install github.com/mattermost/migration-assist/cmd/migration-assist@latest >&2 && /go/bin/migration-assist postgres post-migrate "postgres://postgres:$PG_PW@mattermost-postgres:5432/mattermost?sslmode=disable"' && exit 0
+            echo "Attempt $i failed, retrying..."
+            sleep 15
+          done
+          exit 1
 
       - name: Remove config with credentials
         if: always()
