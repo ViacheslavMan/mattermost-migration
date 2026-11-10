@@ -8,6 +8,7 @@ env:
   COMPOSE_FILE: docker-compose.prod.yml
   DB_POSTGRES_PASSWORD: ${{ secrets.DB_POSTGRES_PASSWORD }}
   DB_MYSQL_ROOT_PASSWORD: ${{ secrets.DB_MYSQL_ROOT_PASSWORD }}
+  NET: mattermost_mattermost_network
 
 jobs:
   migrate-and-deploy:
@@ -20,14 +21,14 @@ jobs:
         id: check_status
         run: |
           if [ -f "$HOME/.mattermost_migration_completed" ]; then
-            echo "Already migrated. Skipping data transfer."
+            echo "Already migrated. Skipping backup and data transfer."
             echo "already_migrated=true" >> $GITHUB_OUTPUT
           else
             echo "Migration required."
             echo "already_migrated=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Stop legacy Mattermost app
+      - name: Stop Mattermost app
         if: steps.check_status.outputs.already_migrated == 'false'
         run: docker stop mattermost || true
 
@@ -51,15 +52,62 @@ jobs:
           docker compose -f $COMPOSE_FILE up -d mattermost-postgres
           sleep 15
 
-      - name: Run pgloader (include drop for idempotency)
+      # Идемпотентность: каждая попытка миграции начинается с чистой базы
+      - name: Recreate empty PostgreSQL database
         if: steps.check_status.outputs.already_migrated == 'false'
         run: |
-          docker run --rm --platform linux/amd64 \
-            --network=mattermost_mattermost_network \
-            mattermost/mattermost-pgloader:latest pgloader \
-            --with "include drop" \
-            "mysql://root:${DB_MYSQL_ROOT_PASSWORD}@mattermost-mysql/mattermost" \
-            "postgresql://postgres:${DB_POSTGRES_PASSWORD}@mattermost-postgres/mattermost"
+          docker exec mattermost-postgres psql -U postgres -c "DROP DATABASE IF EXISTS mattermost WITH (FORCE);"
+          docker exec mattermost-postgres psql -U postgres -c "CREATE DATABASE mattermost;"
+
+      # Mattermost 12 сам создаёт правильную схему в пустой базе
+      - name: Let Mattermost 12 create the schema
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          docker compose -f $COMPOSE_FILE up -d mattermost
+          for i in $(seq 1 90); do
+            if curl -fs http://localhost:8065/api/v4/system/ping > /dev/null; then
+              echo "Schema created, Mattermost is up."
+              break
+            fi
+            echo "Waiting for Mattermost ($i/90)..."
+            sleep 10
+          done
+          curl -fs http://localhost:8065/api/v4/system/ping > /dev/null
+          docker stop mattermost
+
+      - name: Truncate auto-created data (keep schema)
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          docker exec mattermost-postgres psql -U postgres -d mattermost -c "DO \$\$ DECLARE r record; BEGIN FOR r IN SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename NOT IN ('db_migrations','db_lock') LOOP EXECUTE format('TRUNCATE TABLE public.%I CASCADE', r.tablename); END LOOP; END \$\$;"
+
+      - name: Generate pgloader config
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          docker run --rm --network $NET \
+            -e MYSQL_PW="$DB_MYSQL_ROOT_PASSWORD" -e PG_PW="$DB_POSTGRES_PASSWORD" \
+            golang:1.23 sh -c 'go install github.com/mattermost/migration-assist/cmd/migration-assist@latest >&2 && /go/bin/migration-assist pgloader --mysql="root:$MYSQL_PW@tcp(mattermost-mysql:3306)/mattermost" --postgres="postgres://postgres:$PG_PW@mattermost-postgres:5432/mattermost?sslmode=disable" --remove-null-chars' > migration.load
+
+      - name: Run pgloader (data only)
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          docker run --rm --platform linux/amd64 --network $NET \
+            -v "$GITHUB_WORKSPACE":/home/migration \
+            mattermost/mattermost-pgloader:latest pgloader /home/migration/migration.load 2>&1 | tee pgloader.log
+          if grep -q "Database error" pgloader.log; then
+            echo "pgloader reported data errors"
+            exit 1
+          fi
+          docker exec mattermost-postgres psql -U postgres -c "ALTER ROLE postgres RESET search_path;"
+          docker exec mattermost-postgres psql -U postgres -c "ALTER DATABASE mattermost RESET search_path;"
+
+      - name: Create indexes (post-migrate)
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          docker run --rm --network $NET -e PG_PW="$DB_POSTGRES_PASSWORD" golang:1.23 sh -c 'go install github.com/mattermost/migration-assist/cmd/migration-assist@latest >&2 && /go/bin/migration-assist postgres post-migrate "postgres://postgres:$PG_PW@mattermost-postgres:5432/mattermost?sslmode=disable"'
+
+      - name: Remove config with credentials
+        if: always()
+        run: rm -f migration.load
 
       - name: Mark Migration as Completed
         if: steps.check_status.outputs.already_migrated == 'false'
@@ -71,13 +119,14 @@ jobs:
 
       - name: Health Check
         run: |
-          for i in $(seq 1 40); do
+          for i in $(seq 1 60); do
             if curl -fsS http://localhost:8065/api/v4/system/ping; then
               echo ""
               echo "Mattermost is running on Postgres!"
+              docker exec mattermost-postgres psql -U postgres -d mattermost -c "select count(*) as posts from posts;"
               exit 0
             fi
-            echo "Waiting for Mattermost ($i/40)..."
+            echo "Waiting for Mattermost ($i/60)..."
             sleep 6
           done
           echo "Health check failed. Logs:"
