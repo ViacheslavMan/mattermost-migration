@@ -1,2 +1,3 @@
 migration.load
 pgloader.log
+legacy/.env

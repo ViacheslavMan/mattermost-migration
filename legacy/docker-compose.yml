@@ -7,7 +7,7 @@ services:
       - "8065:8065"
     environment:
       - MM_SQLSETTINGS_DRIVERNAME=mysql
-      - MM_SQLSETTINGS_DATASOURCE=root:MyRootPass123@tcp(mattermost-mysql:3306)/mattermost?charset=utf8mb4,utf8&writeTimeout=30s
+      - MM_SQLSETTINGS_DATASOURCE=root:${MYSQL_ROOT_PASSWORD}@tcp(mattermost-mysql:3306)/mattermost?charset=utf8mb4,utf8&writeTimeout=30s
       - MM_SERVICESETTINGS_SITEURL=http://localhost:8065
     volumes:
       - mattermost_data:/mattermost/data
@@ -22,7 +22,7 @@ services:
     image: mysql:8.0
     container_name: mattermost-mysql
     environment:
-      - MYSQL_ROOT_PASSWORD=MyRootPass123
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
       - MYSQL_DATABASE=mattermost
       - TZ=UTC
     command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_general_ci"]
